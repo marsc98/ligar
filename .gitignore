@@ -1,0 +1,19 @@
+# Credenciais — nunca versionar
+main/wifi_config.h
+
+# Build ESP-IDF
+build/
+sdkconfig.old
+
+# Arquivos de gravação
+*.wav
+*.pcm
+
+# Web
+web/node_modules/
+web/dist/
+web/.yarn/cache/
+
+# Sistema
+.DS_Store
+*.log
