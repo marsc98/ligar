@@ -14,6 +14,7 @@ export function useAudioPlayer(): {
   const stop = () => {
     const audio = audioRef.current
     if (audio) {
+      audio.onended = null
       audio.pause()
       audio.src = ''
     }
@@ -34,6 +35,7 @@ export function useAudioPlayer(): {
     const audio = audioRef.current
     if (audio) {
       audio.src = url
+      audio.onended = stop
       audio.play()
     }
     setCurrentId(recording.id)

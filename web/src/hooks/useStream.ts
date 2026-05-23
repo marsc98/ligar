@@ -2,6 +2,8 @@ import { useRef, useState } from 'react'
 
 type UseStreamOptions = {
   onWindow: (audio: Float32Array) => void
+  onChunk?: (samples: Int16Array) => void
+  onDisconnect?: () => void
 }
 
 type UseStreamReturn = {
@@ -10,7 +12,7 @@ type UseStreamReturn = {
   disconnectStream: () => void
 }
 
-export function useStream({ onWindow }: UseStreamOptions): UseStreamReturn {
+export function useStream({ onWindow, onChunk, onDisconnect }: UseStreamOptions): UseStreamReturn {
   const [streaming, setStreaming] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const bufferRef = useRef<number[]>([])
@@ -31,11 +33,16 @@ export function useStream({ onWindow }: UseStreamOptions): UseStreamReturn {
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
-    ws.onopen = () => setStreaming(true)
+    ws.onopen = () => {
+      if (wsRef.current !== ws) return
+      setStreaming(true)
+    }
 
     ws.onmessage = (ev) => {
+      if (wsRef.current !== ws) return
       if (!(ev.data instanceof ArrayBuffer)) return
       const chunk = new Int16Array(ev.data)
+      onChunk?.(chunk)
       for (let i = 0; i < chunk.length; i++) {
         bufferRef.current.push(chunk[i])
       }
@@ -54,21 +61,29 @@ export function useStream({ onWindow }: UseStreamOptions): UseStreamReturn {
     }
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return
+      wsRef.current = null
       bufferRef.current = []
       setStreaming(false)
+      onDisconnect?.()
     }
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) return
+      wsRef.current = null
       bufferRef.current = []
       setStreaming(false)
+      onDisconnect?.()
     }
   }
 
   const disconnectStream = () => {
-    wsRef.current?.close()
+    const ws = wsRef.current
     wsRef.current = null
+    ws?.close()
     bufferRef.current = []
     setStreaming(false)
+    onDisconnect?.()
   }
 
   return { streaming, connectStream, disconnectStream }

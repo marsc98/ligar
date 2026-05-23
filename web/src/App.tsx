@@ -4,6 +4,7 @@ import { useRecordings } from './hooks/useRecordings'
 import { useAudioPlayer } from './hooks/useAudioPlayer'
 import { useWhisper } from './hooks/useWhisper'
 import { useStream } from './hooks/useStream'
+import { useStreamVisualizer } from './hooks/useStreamVisualizer'
 import { ConnectionPanel } from './components/ConnectionPanel'
 import { RecordingList } from './components/RecordingList'
 import { LanguageSelect, WHISPER_LANG } from './components/LanguageSelect'
@@ -23,10 +24,11 @@ function handleDownload(recording: Recording) {
 export function App() {
   const [language, setLanguage] = useState<LanguageCode>('pt')
   const [liveText, setLiveText] = useState('')
-  const [ip, setIp] = useState('')
+  const [ip, setIp] = useState('192.168.0.')
 
   const { recordings, loading, dbError, addRecording, deleteRecording, updateTranscription } = useRecordings()
   const { currentId, audioRef, play, stop } = useAudioPlayer()
+  const viz = useStreamVisualizer()
 
   const { transcribe, transcribeLive, modelStatus, transcribingIds } = useWhisper({
     language: WHISPER_LANG[language],
@@ -34,7 +36,14 @@ export function App() {
     onLive: (text) => setLiveText(prev => prev ? prev + ' ' + text : text),
   })
 
-  const { streaming, connectStream, disconnectStream } = useStream({ onWindow: transcribeLive })
+  const { streaming, connectStream, disconnectStream } = useStream({
+    onWindow: transcribeLive,
+    onChunk: viz.pushChunk,
+    onDisconnect: () => {
+      viz.stop()
+      setLiveText('')
+    },
+  })
 
   const { state, error, connect, disconnect } = useConnection(
     async (blob, duration) => {
@@ -52,9 +61,13 @@ export function App() {
     disconnect()
   }
 
+  const handleConnectStream = (ip: string) => {
+    viz.start()
+    connectStream(ip)
+  }
+
   const handleDisconnectStream = () => {
     disconnectStream()
-    setLiveText('')
   }
 
   return (
@@ -85,7 +98,7 @@ export function App() {
       />
       <div style={{ marginBottom: 16 }}>
         <button
-          onClick={() => streaming ? handleDisconnectStream() : connectStream(ip)}
+          onClick={() => streaming ? handleDisconnectStream() : handleConnectStream(ip)}
           disabled={!streaming && !ip.trim()}
           style={{
             background: streaming ? '#ef444422' : '#22c55e22',
@@ -101,12 +114,17 @@ export function App() {
           {streaming ? 'Parar stream ao vivo' : 'Iniciar stream ao vivo'}
         </button>
       </div>
-      <LiveTranscriptPanel text={liveText} active={streaming} />
+      <LiveTranscriptPanel
+        text={liveText}
+        active={streaming}
+        vizProps={{ canvasRef: viz.canvasRef, mode: viz.mode, onModeChange: viz.setMode }}
+      />
       <RecordingList
         recordings={recordings}
         loading={loading}
         currentId={currentId}
         transcribingIds={transcribingIds}
+        audioRef={audioRef}
         onPlay={play}
         onDelete={handleDelete}
         onDownload={handleDownload}

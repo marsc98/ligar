@@ -8,6 +8,8 @@ export interface Recording {
   transcription?: string
 }
 
+export type VisualizerMode = 'waveform' | 'fft' | 'both'
+
 export type ConnectionState =
   | 'disconnected'
   | 'connecting'
