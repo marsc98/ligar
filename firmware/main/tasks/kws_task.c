@@ -3,8 +3,8 @@
 #include "led_task.h"
 #include "drivers/i2s_driver.h"
 #include "mfcc.h"
-#include "dtw.h"
-#include "templates.h"
+#include "mlp.h"
+#include "weights.h"
 #include "color_catalog.h"
 #include "driver/gpio.h"
 #include "esp_http_server.h"
@@ -18,13 +18,13 @@
 #include <stdio.h>
 
 #define PIN_LED                  2
+#define PIN_AWAIT_LED            23
 #define VAD_RMS_THRESHOLD        300.0f
-#define DTW_THRESHOLD_DEFAULT    2.0f
-#define DTW_WINDOW               6
 #define DETECTION_COOLDOWN_MS    1000
 #define TEMPORAL_VAR_THRESHOLD   0.3f
-#define GARBAGE_RATIO_THRESHOLD  0.75f
 #define COLOR_TIMEOUT_MS         2000
+/* threshold ajustável via /threshold endpoint (g_dtw_threshold), clampeado a [0,1] */
+#define MLP_THRESHOLD_DEFAULT    0.50f
 
 static const char *TAG = "KWS";
 
@@ -35,6 +35,7 @@ static int        s_kws_ring_pos = 0;
 static float      s_mfcc_out[MFCC_N_FRAMES * MFCC_N_COEFS];
 static kws_mode_t s_kws_mode          = KWS_IDLE;
 static TickType_t s_color_timeout_tick = 0;
+static bool       s_led_on             = false;
 
 static esp_err_t ws_send_text(httpd_handle_t hd, int fd, const char *text) {
     httpd_ws_frame_t pkt = {
@@ -46,6 +47,8 @@ static esp_err_t ws_send_text(httpd_handle_t hd, int fd, const char *text) {
     };
     return httpd_ws_send_frame_async(hd, fd, &pkt);
 }
+
+static void send_led(uint8_t r, uint8_t g, uint8_t b);
 
 static esp_err_t ws_monitor_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) {
@@ -60,13 +63,51 @@ static esp_err_t ws_monitor_handler(httpd_req_t *req) {
     uint8_t          buf[16] = {};
     pkt.payload = buf;
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, sizeof(buf));
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK || pkt.type == HTTPD_WS_TYPE_CLOSE) {
         int closing_fd = httpd_req_to_sockfd(req);
         xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
         if (g_ws_monitor_fd == closing_fd) g_ws_monitor_fd = -1;
         xSemaphoreGive(g_ws_mutex);
     }
     return ret;
+}
+
+static esp_err_t http_led_handler(httpd_req_t *req) {
+    char query[64] = {};
+    if (httpd_req_get_url_query_len(req) > 0)
+        httpd_req_get_url_query_str(req, query, sizeof(query));
+
+    char color_str[32] = {};
+    char intensity_str[8] = {};
+
+    if (httpd_query_key_value(query, "color", color_str, sizeof(color_str)) != ESP_OK ||
+        httpd_query_key_value(query, "intensity", intensity_str, sizeof(intensity_str)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "Bad Request");
+        return ESP_OK;
+    }
+
+    int intensity = -1;
+    if (sscanf(intensity_str, "%d", &intensity) != 1 || intensity < 0 || intensity > 100) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "Bad Request");
+        return ESP_OK;
+    }
+
+    uint8_t r, g, b;
+    if (!color_lookup(color_str, &r, &g, &b)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "Bad Request");
+        return ESP_OK;
+    }
+
+    send_led((uint8_t)((int)r * intensity / 100),
+             (uint8_t)((int)g * intensity / 100),
+             (uint8_t)((int)b * intensity / 100));
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 static esp_err_t http_threshold_handler(httpd_req_t *req) {
@@ -109,26 +150,10 @@ static float compute_temporal_var(const float *mfcc, int n_frames, int n_coefs) 
     return var_sum / n_coefs;
 }
 
-static int find_trigger_idx(const char *name) {
-    for (int w = 0; w < KWS_N_TRIGGERS; w++) {
-        if (strcmp(KWS_TRIGGERS[w].name, name) == 0) return w;
-    }
-    return -1;
-}
-
-static float best_dist_for_word(const kws_word_t *word) {
-    float wd = 1e9f;
-    for (int t = 0; t < word->n_templates; t++) {
-        float d = dtw_distance(s_mfcc_out, word->templates[t],
-                               MFCC_N_FRAMES, MFCC_N_COEFS, DTW_WINDOW);
-        if (d < wd) wd = d;
-    }
-    return wd;
-}
-
 static void send_led(uint8_t r, uint8_t g, uint8_t b) {
     led_command_t cmd = { .r = r, .g = g, .b = b };
     xQueueSend(g_led_queue, &cmd, 0);
+    s_led_on = (r | g | b) != 0;
 }
 
 void kws_task_register_handlers(httpd_handle_t server) {
@@ -147,6 +172,13 @@ void kws_task_register_handlers(httpd_handle_t server) {
         .handler = http_threshold_handler,
     };
     httpd_register_uri_handler(server, &threshold_uri);
+
+    httpd_uri_t led_uri = {
+        .uri     = "/led",
+        .method  = HTTP_GET,
+        .handler = http_led_handler,
+    };
+    httpd_register_uri_handler(server, &led_uri);
 }
 
 void kws_task(void *arg) {
@@ -158,40 +190,29 @@ void kws_task(void *arg) {
     static float   s_peak_rms      = 0.0f;
     static int     s_voiced_chunks = 0;
 
-    ESP_LOGI(TAG, "KWS iniciado");
-
-    const int garbage_idx = find_trigger_idx("garbage");
-    const int ligar_idx   = find_trigger_idx("ligar");
-    const int desligar_idx = find_trigger_idx("desligar");
+    ESP_LOGI(TAG, "KWS iniciado (MLP)");
 
     while (1) {
-        if (g_app_state != APP_IDLE) {
-            /* Botão pressionado durante AWAIT_COLOR cancela espera */
-            if (s_kws_mode == KWS_AWAIT_COLOR) {
-                s_kws_mode = KWS_IDLE;
-                ESP_LOGI(TAG, "KWS_AWAIT_COLOR cancelado (botão)");
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
         /* Verifica timeout do modo AWAIT_COLOR */
         if (s_kws_mode == KWS_AWAIT_COLOR) {
             if ((xTaskGetTickCount() - s_color_timeout_tick) > pdMS_TO_TICKS(COLOR_TIMEOUT_MS)) {
                 s_kws_mode = KWS_IDLE;
+                gpio_set_level(PIN_AWAIT_LED, 0);
                 ESP_LOGI(TAG, "KWS_AWAIT_COLOR timeout — voltando a IDLE");
             }
         }
 
-        size_t n = i2s_read_16bit(chunk, I2S_READ_CHUNK);
-        if (n == 0) continue;
+        i2s_chunk_t ichunk;
+        if (xQueueReceive(g_kws_queue, &ichunk, pdMS_TO_TICKS(50)) != pdTRUE) continue;
+        size_t n = ichunk.n;
+        memcpy(chunk, ichunk.samples, n * sizeof(int16_t));
 
         for (size_t i = 0; i < n; i++) {
             s_kws_ring[s_kws_ring_pos] = chunk[i];
             s_kws_ring_pos = (s_kws_ring_pos + 1) % MFCC_WIN_SAMPLES;
         }
 
-        float rms      = compute_rms(chunk, n);
+        float rms       = compute_rms(chunk, n);
         bool  is_voiced = (rms >= VAD_RMS_THRESHOLD);
 
         if (is_voiced) {
@@ -212,13 +233,19 @@ void kws_task(void *arg) {
                 int mon_fd = g_ws_monitor_fd;
                 xSemaphoreGive(g_ws_mutex);
                 if (mon_fd >= 0) {
-                    char hb[128];
+                    char hb[160];
                     snprintf(hb, sizeof(hb),
-                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"dists\":{},"
+                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"probs\":{},"
                              "\"rejected\":\"too_short\",\"kws_mode\":\"%s\"}",
-                             rms, g_dtw_threshold,
+                             rms, (double)g_dtw_threshold,
                              s_kws_mode == KWS_IDLE ? "idle" : "await_color");
-                    ws_send_text(server, mon_fd, hb);
+                    esp_err_t ws_ret = ws_send_text(server, mon_fd, hb);
+                    if (ws_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                        xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                        if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                        xSemaphoreGive(g_ws_mutex);
+                    }
                 }
                 continue;
             }
@@ -229,13 +256,19 @@ void kws_task(void *arg) {
                 int mon_fd = g_ws_monitor_fd;
                 xSemaphoreGive(g_ws_mutex);
                 if (mon_fd >= 0) {
-                    char hb[128];
+                    char hb[160];
                     snprintf(hb, sizeof(hb),
-                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"dists\":{},"
+                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"probs\":{},"
                              "\"rejected\":\"cooldown\",\"kws_mode\":\"%s\"}",
-                             rms, g_dtw_threshold,
+                             rms, (double)g_dtw_threshold,
                              s_kws_mode == KWS_IDLE ? "idle" : "await_color");
-                    ws_send_text(server, mon_fd, hb);
+                    esp_err_t ws_ret = ws_send_text(server, mon_fd, hb);
+                    if (ws_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                        xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                        if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                        xSemaphoreGive(g_ws_mutex);
+                    }
                 }
                 continue;
             }
@@ -249,187 +282,151 @@ void kws_task(void *arg) {
                 int mon_fd = g_ws_monitor_fd;
                 xSemaphoreGive(g_ws_mutex);
                 if (mon_fd >= 0) {
-                    char hb[160];
+                    char hb[192];
                     snprintf(hb, sizeof(hb),
-                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"dists\":{},"
+                             "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"probs\":{},"
                              "\"var\":%.3f,\"rejected\":\"var_gate\",\"kws_mode\":\"%s\"}",
-                             rms, g_dtw_threshold, temporal_var,
+                             rms, (double)g_dtw_threshold, temporal_var,
                              s_kws_mode == KWS_IDLE ? "idle" : "await_color");
-                    ws_send_text(server, mon_fd, hb);
+                    esp_err_t ws_ret = ws_send_text(server, mon_fd, hb);
+                    if (ws_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                        xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                        if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                        xSemaphoreGive(g_ws_mutex);
+                    }
                 }
                 continue;
             }
 
-            /* ── Comparação por modo ── */
-            const char *detected_word   = NULL;
-            float       best_dist_val   = 1e9f;
-            const char *reject_reason   = NULL;
-            bool        led_action      = false;
+            /* ── MLP inference ── */
+            static float s_probs[MLP_N_CLASSES];
+            mlp_infer(s_mfcc_out, s_probs);
+
+            int best = 0;
+            for (int i = 1; i < MLP_N_CLASSES; i++)
+                if (s_probs[i] > s_probs[best]) best = i;
+
+            static int s_garbage_idx = -1;
+            if (s_garbage_idx < 0) {
+                for (int i = 0; i < MLP_N_CLASSES; i++)
+                    if (strcmp(MLP_CLASS_NAMES[i], "garbage") == 0) s_garbage_idx = i;
+            }
+
+            float mlp_thr = (g_dtw_threshold > 0.0f && g_dtw_threshold <= 1.0f)
+                            ? g_dtw_threshold : MLP_THRESHOLD_DEFAULT;
+            bool valid = (s_probs[best] >= mlp_thr) && (best != s_garbage_idx);
+            const char *detected_word = valid ? MLP_CLASS_NAMES[best] : NULL;
 
             if (s_kws_mode == KWS_IDLE) {
-                /* Compara contra KWS_TRIGGERS */
-                float trigger_best[KWS_N_TRIGGERS];
-                int   best_word = -1;
-                for (int w = 0; w < KWS_N_TRIGGERS; w++) {
-                    trigger_best[w] = best_dist_for_word(&KWS_TRIGGERS[w]);
-                    if (trigger_best[w] < best_dist_val) {
-                        best_dist_val = trigger_best[w];
-                        best_word     = w;
-                    }
-                }
-
-                float garbage_dist = (garbage_idx >= 0) ? trigger_best[garbage_idx] : 1e9f;
-                bool  below_thr    = (best_word >= 0 && best_word != garbage_idx &&
-                                      best_dist_val < g_dtw_threshold);
-                bool  ratio_ok     = true;
-                if (below_thr && garbage_idx >= 0) {
-                    float ratio = best_dist_val / garbage_dist;
-                    ratio_ok = (ratio < GARBAGE_RATIO_THRESHOLD);
-                    if (!ratio_ok) reject_reason = "garbage_ratio";
-                }
-
-                if (below_thr && ratio_ok) {
-                    detected_word  = KWS_TRIGGERS[best_word].name;
+                if (detected_word) {
                     last_detection = now;
-
-                    if (best_word == ligar_idx) {
-                        s_kws_mode          = KWS_AWAIT_COLOR;
-                        s_color_timeout_tick = now;
-                        ESP_LOGI(TAG, "\"ligar\" detectado — aguardando cor");
-                    } else if (best_word == desligar_idx) {
+                    if (strcmp(detected_word, "ligar") == 0) {
+                        if (!s_led_on) {
+                            send_led(255, 255, 255);
+                            ESP_LOGI(TAG, "\"ligar\" — LED apagado, ligando branco");
+                        } else {
+                            s_kws_mode           = KWS_AWAIT_COLOR;
+                            s_color_timeout_tick = now;
+                            gpio_set_level(PIN_AWAIT_LED, 1);
+                            ESP_LOGI(TAG, "\"ligar\" — LED ligado, aguardando cor");
+                        }
+                    } else if (strcmp(detected_word, "desligar") == 0) {
                         send_led(0, 0, 0);
                         ESP_LOGI(TAG, "\"desligar\" — LED apagado");
                     }
-
                     gpio_set_level(PIN_LED, 1);
                     vTaskDelay(pdMS_TO_TICKS(200));
                     gpio_set_level(PIN_LED, 0);
-                    led_action = true;
                 }
 
-                /* JSON do monitor */
                 xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
                 int mon_fd = g_ws_monitor_fd;
                 xSemaphoreGive(g_ws_mutex);
                 if (mon_fd >= 0) {
-                    char json[512];
+                    char json[560];
                     int  pos = snprintf(json, sizeof(json),
-                                        "{\"rms\":%.1f,\"threshold\":%.1f,\"var\":%.3f,"
-                                        "\"word\":%s%s%s,\"dists\":{",
-                                        rms, g_dtw_threshold, temporal_var,
+                                        "{\"rms\":%.1f,\"threshold\":%.2f,\"var\":%.3f,"
+                                        "\"word\":%s%s%s,\"probs\":{",
+                                        rms, (double)g_dtw_threshold, temporal_var,
                                         detected_word ? "\"" : "",
                                         detected_word ? detected_word : "null",
                                         detected_word ? "\"" : "");
-                    for (int w = 0; w < KWS_N_TRIGGERS && pos < (int)sizeof(json) - 32; w++) {
+                    for (int i = 0; i < MLP_N_CLASSES && pos < (int)sizeof(json) - 32; i++) {
                         pos += snprintf(json + pos, sizeof(json) - pos,
-                                        "%s\"%s\":%.1f",
-                                        w > 0 ? "," : "",
-                                        KWS_TRIGGERS[w].name, trigger_best[w]);
+                                        "%s\"%s\":%.3f",
+                                        i > 0 ? "," : "",
+                                        MLP_CLASS_NAMES[i], s_probs[i]);
                     }
-                    pos += snprintf(json + pos, sizeof(json) - pos, "}");
-                    if (garbage_idx >= 0 && garbage_dist < 1e8f)
-                        pos += snprintf(json + pos, sizeof(json) - pos,
-                                        ",\"garbage_dist\":%.1f", garbage_dist);
-                    if (reject_reason)
-                        pos += snprintf(json + pos, sizeof(json) - pos,
-                                        ",\"rejected\":\"%s\"", reject_reason);
                     pos += snprintf(json + pos, sizeof(json) - pos,
-                                    ",\"kws_mode\":\"idle\"}");
-                    ws_send_text(server, mon_fd, json);
+                                    "},\"kws_mode\":\"idle\"}");
+                    (void)pos;
+                    esp_err_t ws_ret = ws_send_text(server, mon_fd, json);
+                    if (ws_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                        xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                        if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                        xSemaphoreGive(g_ws_mutex);
+                    }
                 }
 
             } else { /* KWS_AWAIT_COLOR */
-                /* Compara contra KWS_COLORS */
-                float color_best[KWS_N_COLORS];
-                int   best_color = -1;
-                for (int w = 0; w < KWS_N_COLORS; w++) {
-                    color_best[w] = best_dist_for_word(&KWS_COLORS[w]);
-                    if (color_best[w] < best_dist_val) {
-                        best_dist_val = color_best[w];
-                        best_color    = w;
-                    }
-                }
-
-                bool color_detected = (best_color >= 0 && best_dist_val < g_dtw_threshold);
-
-                if (color_detected) {
-                    detected_word = KWS_COLORS[best_color].name;
-                    last_detection = now;
+                if (detected_word) {
                     uint8_t r, g_val, b;
                     if (color_lookup(detected_word, &r, &g_val, &b)) {
                         send_led(r, g_val, b);
+                        s_kws_mode = KWS_IDLE;
+                        gpio_set_level(PIN_AWAIT_LED, 0);
+                        last_detection = now;
                         ESP_LOGI(TAG, "Cor detectada: %s → LED RGB(%d,%d,%d)",
                                  detected_word, r, g_val, b);
+                    } else if (strcmp(detected_word, "desligar") == 0) {
+                        send_led(0, 0, 0);
+                        s_kws_mode = KWS_IDLE;
+                        gpio_set_level(PIN_AWAIT_LED, 0);
+                        last_detection = now;
+                        ESP_LOGI(TAG, "\"desligar\" em AWAIT_COLOR — LED apagado");
+                    } else if (strcmp(detected_word, "ligar") == 0) {
+                        s_color_timeout_tick = now;
+                        last_detection = now;
+                        ESP_LOGI(TAG, "\"ligar\" em AWAIT_COLOR — timer reiniciado");
                     }
-                    s_kws_mode = KWS_IDLE;
                     gpio_set_level(PIN_LED, 1);
                     vTaskDelay(pdMS_TO_TICKS(200));
                     gpio_set_level(PIN_LED, 0);
-                    led_action = true;
-                } else {
-                    /* Nenhuma cor abaixo do threshold — verifica triggers especiais */
-                    float trigger_best[KWS_N_TRIGGERS];
-                    int   best_trig = -1;
-                    float trig_best_dist = 1e9f;
-                    for (int w = 0; w < KWS_N_TRIGGERS; w++) {
-                        trigger_best[w] = best_dist_for_word(&KWS_TRIGGERS[w]);
-                        if (w == garbage_idx) continue;
-                        if (trigger_best[w] < trig_best_dist) {
-                            trig_best_dist = trigger_best[w];
-                            best_trig      = w;
-                        }
-                    }
-
-                    if (best_trig >= 0 && trig_best_dist < g_dtw_threshold) {
-                        detected_word  = KWS_TRIGGERS[best_trig].name;
-                        last_detection = now;
-
-                        if (best_trig == ligar_idx) {
-                            s_color_timeout_tick = now; /* reinicia timer */
-                            ESP_LOGI(TAG, "\"ligar\" em AWAIT_COLOR — timer reiniciado");
-                        } else if (best_trig == desligar_idx) {
-                            send_led(0, 0, 0);
-                            s_kws_mode = KWS_IDLE;
-                            ESP_LOGI(TAG, "\"desligar\" em AWAIT_COLOR — LED apagado");
-                        }
-                        gpio_set_level(PIN_LED, 1);
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        gpio_set_level(PIN_LED, 0);
-                        led_action = true;
-                    }
                 }
 
-                /* JSON do monitor */
                 xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
                 int mon_fd = g_ws_monitor_fd;
                 xSemaphoreGive(g_ws_mutex);
                 if (mon_fd >= 0) {
-                    char json[512];
+                    char json[560];
                     int  pos = snprintf(json, sizeof(json),
-                                        "{\"rms\":%.1f,\"threshold\":%.1f,\"var\":%.3f,"
-                                        "\"word\":%s%s%s,\"dists\":{",
-                                        rms, g_dtw_threshold, temporal_var,
+                                        "{\"rms\":%.1f,\"threshold\":%.2f,\"var\":%.3f,"
+                                        "\"word\":%s%s%s,\"probs\":{",
+                                        rms, (double)g_dtw_threshold, temporal_var,
                                         detected_word ? "\"" : "",
                                         detected_word ? detected_word : "null",
                                         detected_word ? "\"" : "");
-                    for (int w = 0; w < KWS_N_COLORS && pos < (int)sizeof(json) - 64; w++) {
+                    for (int i = 0; i < MLP_N_CLASSES && pos < (int)sizeof(json) - 32; i++) {
                         pos += snprintf(json + pos, sizeof(json) - pos,
-                                        "%s\"%s\":%.1f",
-                                        w > 0 ? "," : "",
-                                        KWS_COLORS[w].name, color_best[w]);
+                                        "%s\"%s\":%.3f",
+                                        i > 0 ? "," : "",
+                                        MLP_CLASS_NAMES[i], s_probs[i]);
                     }
-                    if (reject_reason)
-                        pos += snprintf(json + pos, sizeof(json) - pos,
-                                        "},\"rejected\":\"%s\"", reject_reason);
-                    else
-                        pos += snprintf(json + pos, sizeof(json) - pos, "}");
                     pos += snprintf(json + pos, sizeof(json) - pos,
-                                    ",\"kws_mode\":\"await_color\"}");
-                    ws_send_text(server, mon_fd, json);
+                                    "},\"kws_mode\":\"await_color\"}");
+                    (void)pos;
+                    esp_err_t ws_ret = ws_send_text(server, mon_fd, json);
+                    if (ws_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                        xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                        if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                        xSemaphoreGive(g_ws_mutex);
+                    }
                 }
             }
 
-            (void)led_action;
             continue;
         }
 
@@ -441,13 +438,19 @@ void kws_task(void *arg) {
             int mon_fd = g_ws_monitor_fd;
             xSemaphoreGive(g_ws_mutex);
             if (mon_fd >= 0) {
-                char hb[128];
+                char hb[160];
                 snprintf(hb, sizeof(hb),
-                         "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"dists\":{},"
+                         "{\"rms\":%.1f,\"threshold\":%.2f,\"word\":null,\"probs\":{},"
                          "\"kws_mode\":\"%s\"}",
-                         rms, g_dtw_threshold,
+                         rms, (double)g_dtw_threshold,
                          s_kws_mode == KWS_IDLE ? "idle" : "await_color");
-                ws_send_text(server, mon_fd, hb);
+                esp_err_t ws_ret = ws_send_text(server, mon_fd, hb);
+                if (ws_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "monitor send falhou fd=%d", mon_fd);
+                    xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                    if (g_ws_monitor_fd == mon_fd) g_ws_monitor_fd = -1;
+                    xSemaphoreGive(g_ws_mutex);
+                }
             }
         }
     }

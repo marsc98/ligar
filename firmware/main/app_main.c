@@ -3,6 +3,7 @@
 #include "tasks/kws_task.h"
 #include "tasks/button_task.h"
 #include "tasks/led_task.h"
+#include "tasks/i2s_reader_task.h"
 #include "drivers/i2s_driver.h"
 #include "drivers/ledc_driver.h"
 #include "driver/gpio.h"
@@ -17,21 +18,23 @@
 #include "wifi_config.h"
 #include <string.h>
 
-#define PIN_BUTTON 4
-#define PIN_LED    2
+#define PIN_BUTTON    4
+#define PIN_LED       2
+#define PIN_AWAIT_LED 23
 
 static const char *TAG = "MAIN";
 
 /* ── Definições dos globais declarados em app_state.h ── */
 volatile app_state_t  g_app_state    = APP_IDLE;
-volatile float        g_dtw_threshold = 2.0f;
-bool                  g_kws_paused   = false;
+volatile float        g_dtw_threshold = 4.2f;
 int                   g_ws_record_fd = -1;
 int                   g_ws_stream_fd = -1;
 int                   g_ws_monitor_fd = -1;
 SemaphoreHandle_t     g_ws_mutex;
 QueueHandle_t         g_click_queue;
 QueueHandle_t         g_led_queue;
+QueueHandle_t         g_audio_queue;
+QueueHandle_t         g_kws_queue;
 
 /* ── Wi-Fi ── */
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id,
@@ -82,7 +85,7 @@ static void wifi_init(void) {
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
     config.server_port      = 80;
-    config.max_open_sockets = 7;
+    config.max_open_sockets = 10;
     config.recv_wait_timeout = 120;
     config.send_wait_timeout = 120;
 
@@ -106,12 +109,13 @@ static void gpio_init(void) {
     gpio_config_t led_conf = {
         .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << PIN_LED),
+        .pin_bit_mask = (1ULL << PIN_LED) | (1ULL << PIN_AWAIT_LED),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&led_conf));
     gpio_set_level(PIN_LED, 0);
+    gpio_set_level(PIN_AWAIT_LED, 0);
 }
 
 /* ── App Main ── */
@@ -131,6 +135,8 @@ void app_main(void) {
     g_ws_mutex    = xSemaphoreCreateMutex();
     g_click_queue = xQueueCreate(1, sizeof(uint8_t));
     g_led_queue   = xQueueCreate(4, sizeof(led_command_t));
+    g_audio_queue = xQueueCreate(4, sizeof(i2s_chunk_t));
+    g_kws_queue   = xQueueCreate(4, sizeof(i2s_chunk_t));
 
     i2s_driver_init();
     ledc_driver_init();
@@ -142,10 +148,11 @@ void app_main(void) {
     audio_task_register_handlers(server);
     kws_task_register_handlers(server);
 
-    xTaskCreate(button_task, "btn",   2048, NULL,   5, NULL);
-    xTaskCreate(audio_task,  "audio", 8192, server, 10, NULL);
-    xTaskCreate(kws_task,    "kws",   8192, server, 6,  NULL);
-    xTaskCreate(led_task,    "led",   2048, NULL,   5,  NULL);
+    xTaskCreate(i2s_reader_task, "i2s_rd", 4096, NULL,   12, NULL);
+    xTaskCreate(button_task,     "btn",    2048, NULL,   5,  NULL);
+    xTaskCreate(audio_task,      "audio",  8192, server, 10, NULL);
+    xTaskCreate(kws_task,        "kws",    8192, server, 6,  NULL);
+    xTaskCreate(led_task,        "led",    2048, NULL,   5,  NULL);
 
     ESP_LOGI(TAG, "Sistema pronto. Click para gravar/transmitir.");
 }
