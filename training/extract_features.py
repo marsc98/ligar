@@ -42,19 +42,11 @@ def extract_mfcc(wav_path: Path) -> np.ndarray:
     return mfcc
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--word', required=True, help='Nome da palavra (ex: ligar)')
-    args = parser.parse_args()
-
-    samples_dir = Path('samples')
-    out_dir = Path('features')
-    out_dir.mkdir(exist_ok=True)
-
-    wavs = sorted(samples_dir.glob(f'{args.word}_*.wav'))
+def process_word(word: str, samples_dir: Path, out_dir: Path) -> bool:
+    wavs = sorted(samples_dir.glob(f'{word}_*.wav'))
     if not wavs:
-        print(f'Nenhum WAV encontrado para "{args.word}" em {samples_dir}', file=sys.stderr)
-        sys.exit(1)
+        print(f'Nenhum WAV encontrado para "{word}" em {samples_dir}', file=sys.stderr)
+        return False
 
     features = []
     for wav in wavs:
@@ -66,14 +58,34 @@ def main():
             print(f'ERR {wav.name}: {e}')
 
     if not features:
-        print('Nenhuma amostra processada com sucesso.', file=sys.stderr)
-        sys.exit(1)
+        print(f'Nenhuma amostra processada para "{word}".', file=sys.stderr)
+        return False
 
-    out = out_dir / f'{args.word}.npy'
+    out = out_dir / f'{word}.npy'
     arr = np.stack(features)
     np.save(str(out), arr)
     print(f'\n{len(features)} amostras salvas em {out}')
-    print(f'Shape final: {arr.shape}  (amostras, frames, coefs)')
+    print(f'Shape final: {arr.shape}  (amostras, frames, coefs)\n')
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--word', required=True, nargs='+', help='Palavra(s) a processar (ex: ligar desligar)')
+    args = parser.parse_args()
+
+    samples_dir = Path(__file__).parent / 'samples'
+    out_dir = Path(__file__).parent / 'features'
+    out_dir.mkdir(exist_ok=True)
+
+    failed = []
+    for word in args.word:
+        if not process_word(word, samples_dir, out_dir):
+            failed.append(word)
+
+    if failed:
+        print(f'Falhou: {", ".join(failed)}', file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
