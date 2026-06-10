@@ -9,6 +9,9 @@ import { ConnectionPanel } from './components/ConnectionPanel'
 import { RecordingList } from './components/RecordingList'
 import { LanguageSelect, WHISPER_LANG } from './components/LanguageSelect'
 import { LiveTranscriptPanel } from './components/LiveTranscriptPanel'
+import { MonitorTab } from './components/MonitorTab'
+import { CollectionTab } from './components/CollectionTab'
+import { LightTab } from './components/LightTab'
 import type { LanguageCode } from './components/LanguageSelect'
 import type { Recording } from './types'
 
@@ -25,6 +28,7 @@ export function App() {
   const [language, setLanguage] = useState<LanguageCode>('pt')
   const [liveText, setLiveText] = useState('')
   const [ip, setIp] = useState('192.168.0.')
+  const [activeTab, setActiveTab] = useState<'gravacoes' | 'monitor' | 'coleta' | 'luz'>('gravacoes')
 
   const { recordings, loading, dbError, addRecording, deleteRecording, updateTranscription } = useRecordings()
   const { currentId, audioRef, play, stop } = useAudioPlayer()
@@ -70,6 +74,10 @@ export function App() {
     disconnectStream()
   }
 
+  const handleCollectionSave = async (blob: Blob, duration: number, collection: { word: string; sessionId: string }) => {
+    await addRecording(blob, duration, collection)
+  }
+
   return (
     <main>
       <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 24, color: '#f1f5f9' }}>
@@ -80,55 +88,83 @@ export function App() {
           {dbError}
         </p>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-        <LanguageSelect value={language} onChange={setLanguage} />
-        {modelStatus === 'loading' && (
-          <p style={{ color: '#94a3b8', fontSize: 13, margin: 0 }}>
-            Baixando modelo de fala (primeira vez)...
-          </p>
-        )}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 24, borderBottom: '1px solid #334155', paddingBottom: 0 }}>
+        {(['gravacoes', 'monitor', 'coleta', 'luz'] as const).map(tab => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            style={{
+              background: 'none',
+              border: 'none',
+              borderBottom: activeTab === tab ? '2px solid #3b82f6' : '2px solid transparent',
+              color: activeTab === tab ? '#f1f5f9' : '#64748b',
+              padding: '8px 16px',
+              cursor: 'pointer',
+              fontSize: 14,
+              fontWeight: activeTab === tab ? 600 : 400,
+              marginBottom: -1,
+            }}
+          >
+            {tab === 'gravacoes' ? 'Gravações' : tab === 'monitor' ? 'Monitor' : tab === 'coleta' ? 'Coleta' : 'Luz'}
+          </button>
+        ))}
       </div>
-      <ConnectionPanel
-        state={state}
-        error={error}
-        ip={ip}
-        onIpChange={setIp}
-        onConnect={connect}
-        onDisconnect={handleDisconnect}
-      />
-      <div style={{ marginBottom: 16 }}>
-        <button
-          onClick={() => streaming ? handleDisconnectStream() : handleConnectStream(ip)}
-          disabled={!streaming && !ip.trim()}
-          style={{
-            background: streaming ? '#ef444422' : '#22c55e22',
-            color: streaming ? '#ef4444' : '#22c55e',
-            border: `1px solid ${streaming ? '#ef4444' : '#22c55e'}`,
-            borderRadius: 6,
-            padding: '6px 14px',
-            fontSize: 13,
-            cursor: 'pointer',
-            opacity: !streaming && !ip.trim() ? 0.4 : 1,
-          }}
-        >
-          {streaming ? 'Parar stream ao vivo' : 'Iniciar stream ao vivo'}
-        </button>
-      </div>
-      <LiveTranscriptPanel
-        text={liveText}
-        active={streaming}
-        vizProps={{ canvasRef: viz.canvasRef, mode: viz.mode, onModeChange: viz.setMode }}
-      />
-      <RecordingList
-        recordings={recordings}
-        loading={loading}
-        currentId={currentId}
-        transcribingIds={transcribingIds}
-        audioRef={audioRef}
-        onPlay={play}
-        onDelete={handleDelete}
-        onDownload={handleDownload}
-      />
+      {activeTab === 'gravacoes' && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <LanguageSelect value={language} onChange={setLanguage} />
+            {modelStatus === 'loading' && (
+              <p style={{ color: '#94a3b8', fontSize: 13, margin: 0 }}>
+                Baixando modelo de fala (primeira vez)...
+              </p>
+            )}
+          </div>
+          <ConnectionPanel
+            state={state}
+            error={error}
+            ip={ip}
+            onIpChange={setIp}
+            onConnect={connect}
+            onDisconnect={handleDisconnect}
+          />
+          <div style={{ marginBottom: 16 }}>
+            <button
+              onClick={() => streaming ? handleDisconnectStream() : handleConnectStream(ip)}
+              disabled={!streaming && !ip.trim()}
+              style={{
+                background: streaming ? '#ef444422' : '#22c55e22',
+                color: streaming ? '#ef4444' : '#22c55e',
+                border: `1px solid ${streaming ? '#ef4444' : '#22c55e'}`,
+                borderRadius: 6,
+                padding: '6px 14px',
+                fontSize: 13,
+                cursor: 'pointer',
+                opacity: !streaming && !ip.trim() ? 0.4 : 1,
+              }}
+            >
+              {streaming ? 'Parar stream ao vivo' : 'Iniciar stream ao vivo'}
+            </button>
+          </div>
+          <LiveTranscriptPanel
+            text={liveText}
+            active={streaming}
+            vizProps={{ canvasRef: viz.canvasRef, mode: viz.mode, onModeChange: viz.setMode }}
+          />
+          <RecordingList
+            recordings={recordings}
+            loading={loading}
+            currentId={currentId}
+            transcribingIds={transcribingIds}
+            audioRef={audioRef}
+            onPlay={play}
+            onDelete={handleDelete}
+            onDownload={handleDownload}
+          />
+        </>
+      )}
+      {activeTab === 'monitor' && <MonitorTab ip={ip} />}
+      {activeTab === 'coleta' && <CollectionTab ip={ip} onSave={handleCollectionSave} />}
+      {activeTab === 'luz' && <LightTab ip={ip} />}
       <audio ref={audioRef} />
     </main>
   )

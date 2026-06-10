@@ -6,7 +6,7 @@ export function useRecordings(): {
   recordings: Recording[]
   loading: boolean
   dbError: string | null
-  addRecording(blob: Blob, duration: number): Promise<string>
+  addRecording(blob: Blob, duration: number, collection?: { word: string; sessionId: string }): Promise<string>
   deleteRecording(id: string): Promise<void>
   updateTranscription(id: string, text: string): Promise<void>
 } {
@@ -36,7 +36,7 @@ export function useRecordings(): {
       })
   }, [])
 
-  const addRecording = async (blob: Blob, duration: number): Promise<string> => {
+  const addRecording = async (blob: Blob, duration: number, collection?: { word: string; sessionId: string }): Promise<string> => {
     const db = dbRef.current
     if (!db) return ''
     const id = crypto.randomUUID()
@@ -48,6 +48,7 @@ export function useRecordings(): {
       duration,
       size: blob.size,
       blob,
+      ...(collection ? { collection } : {}),
     }
     try {
       await saveRecording(db, rec)

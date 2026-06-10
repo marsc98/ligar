@@ -6,6 +6,10 @@ export interface Recording {
   size: number
   blob: Blob
   transcription?: string
+  collection?: {
+    word: string
+    sessionId: string
+  }
 }
 
 export type VisualizerMode = 'waveform' | 'fft' | 'both'
