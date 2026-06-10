@@ -1,6 +1,5 @@
 #include "audio_task.h"
 #include "app_state.h"
-#include "drivers/i2s_driver.h"
 #include "driver/gpio.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -14,8 +13,6 @@
 
 #define SAMPLE_RATE 16000
 #define PIN_LED     2
-
-#define I2S_READ_BYTES  (I2S_READ_CHUNK * sizeof(int16_t))
 
 static const char *TAG = "AUDIO";
 
@@ -47,8 +44,6 @@ static esp_err_t ws_record_handler(httpd_req_t *req) {
         xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
         g_ws_record_fd = httpd_req_to_sockfd(req);
         xSemaphoreGive(g_ws_mutex);
-        g_kws_paused = true;
-        ESP_LOGI(TAG, "/record conectado — KWS pausado");
         ESP_LOGI(TAG, "WebSocket /record conectado, fd=%d", g_ws_record_fd);
         return ESP_OK;
     }
@@ -63,7 +58,7 @@ static esp_err_t ws_record_handler(httpd_req_t *req) {
         xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
         if (g_ws_record_fd == closing_fd) {
             g_ws_record_fd = -1;
-            ESP_LOGI(TAG, "/record desconectado — KWS retomado");
+            ESP_LOGI(TAG, "/record desconectado");
         }
         xSemaphoreGive(g_ws_mutex);
     }
@@ -83,7 +78,7 @@ static esp_err_t ws_stream_handler(httpd_req_t *req) {
     uint8_t          buf[16] = {};
     pkt.payload = buf;
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, sizeof(buf));
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK || pkt.type == HTTPD_WS_TYPE_CLOSE) {
         int closing_fd = httpd_req_to_sockfd(req);
         xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
         if (g_ws_stream_fd == closing_fd) g_ws_stream_fd = -1;
@@ -115,13 +110,7 @@ void audio_task_register_handlers(httpd_handle_t server) {
 void audio_task(void *arg) {
     httpd_handle_t server = (httpd_handle_t)arg;
     static size_t  g_record_len = 0;
-
-    int16_t *read_buf = heap_caps_malloc(I2S_READ_BYTES, MALLOC_CAP_DMA);
-    if (!read_buf) {
-        ESP_LOGE(TAG, "Falha ao alocar buffer de leitura");
-        vTaskDelete(NULL);
-        return;
-    }
+    i2s_chunk_t    chunk;
 
     ESP_LOGI(TAG, "Tarefa de áudio iniciada");
 
@@ -175,9 +164,18 @@ void audio_task(void *arg) {
                 xSemaphoreGive(g_ws_mutex);
 
                 if (fd >= 0) {
-                    size_t n = i2s_read_16bit(read_buf, I2S_READ_CHUNK);
-                    if (n > 0)
-                        ws_send_binary(server, fd, read_buf, n * sizeof(int16_t));
+                    if (xQueueReceive(g_audio_queue, &chunk, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+                    size_t n = chunk.n;
+                    int16_t *read_buf = chunk.samples;
+                    if (n > 0) {
+                        if (ws_send_binary(server, fd, read_buf, n * sizeof(int16_t)) != ESP_OK) {
+                            xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
+                            if (g_ws_stream_fd == fd) g_ws_stream_fd = -1;
+                            xSemaphoreGive(g_ws_mutex);
+                            g_app_state = APP_IDLE;
+                            gpio_set_level(PIN_LED, 0);
+                        }
+                    }
                 } else {
                     g_app_state = APP_IDLE;
                     gpio_set_level(PIN_LED, 0);
@@ -197,7 +195,9 @@ void audio_task(void *arg) {
                     break;
                 }
 
-                size_t n = i2s_read_16bit(read_buf, I2S_READ_CHUNK);
+                if (xQueueReceive(g_audio_queue, &chunk, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+                size_t n = chunk.n;
+                int16_t *read_buf = chunk.samples;
                 if (n > 0) {
                     if (ws_send_binary(server, fd, read_buf, n * sizeof(int16_t)) != ESP_OK) {
                         xSemaphoreTake(g_ws_mutex, portMAX_DELAY);
@@ -214,7 +214,7 @@ void audio_task(void *arg) {
             }
 
             case APP_IDLE:
-                vTaskDelay(pdMS_TO_TICKS(10));
+                xQueueReceive(g_audio_queue, &chunk, pdMS_TO_TICKS(20));
                 break;
         }
     }

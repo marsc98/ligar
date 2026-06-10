@@ -13,7 +13,7 @@ void ledc_driver_init(void) {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = LEDC_TIMER_8_BIT,
         .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = 5000,
+        .freq_hz         = 40000,
         .clk_cfg         = LEDC_AUTO_CLK,
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
@@ -48,15 +48,16 @@ void ledc_driver_init(void) {
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ch_b));
 
-    ESP_LOGI(TAG, "LEDC iniciado: R=GPIO%d G=GPIO%d B=GPIO%d @ 5kHz 8-bit",
+    ESP_LOGI(TAG, "LEDC iniciado: R=GPIO%d G=GPIO%d B=GPIO%d @ 40kHz 8-bit",
              PIN_LED_R, PIN_LED_G, PIN_LED_B);
 }
 
 void ledc_set_color(uint8_t r, uint8_t g, uint8_t b) {
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, r);
+    // Circuit is active-low: transistor ON = LED off, so invert duty
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 255 - r);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, g);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 255 - g);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, b);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 255 - b);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
 }
