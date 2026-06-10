@@ -1,68 +1,61 @@
-# ligar
+# Ligar
 
-ESP32 + INMP441 — keyword spotting por voz para controle de LED RGB.
+Esse projeto é um objeto de estudo sobre:
 
-Diga **"ligar"** seguido de uma cor e o LED acende. Diga **"desligar"** e apaga.
-Interface web embarcada para coleta de amostras, monitoramento KWS em tempo real e transcrição Whisper.
+- Como utilizar um microfone INMP441 com uma ESP32 (dando a base para utilizar com outros microcontroladores);
+- Criação de modelos básicos focando no uso para detecção de palavras;
+- Utilizar um modelo amplamente conhecido para aprender melhor como aplicar modelos específicos em tarefas específicas.
 
----
+O resultado do projeto é um dispositivo de hardware que se comunica com um frontend para realizar gravações, transcrições, fazer coleta de amostras para treinar o modelo próprio e monitorar a detecção de palavras do modelo próprio. Todos dados são salvos no localStorage do navegador para checagem.
 
-## Diagrama do circuito
+A ideia é dizer **"ligar"** seguido de uma cor e o LED acende. Diga **"desligar"** e apaga. Foram adicionadas tratativas no sinal e ajustes de peso mas a performance depende muito do número de amostras!
 
-```
-                        ┌──────────────────────────────────────────────────────────┐
-                        │                      ESP32-D0WD                          │
-                        │                                                          │
-  INMP441               │  GPIO 26 ◀── BCLK ──────────┐                           │
- ┌─────────┐            │  GPIO 25 ◀── WS ────────────┤  I2S (16 kHz, mono)       │
- │ VDD 3.3V│───── 3.3V  │  GPIO 22 ◀── SD ────────────┘  32-bit slot, Philips     │
- │ GND     │───── GND   │                                                          │
- │ SCK     │─────────── │  GPIO 26                                                 │
- │ WS      │─────────── │  GPIO 25                                                 │
- │ SD      │─────────── │  GPIO 22                                                 │
- │ L/R     │───── GND   │                                                          │
- └─────────┘            │  GPIO 4 ──── [BOTÃO] ──── GND   (pull-up interno)        │
-                        │  GPIO 2 ──── [LED onboard]                               │
-                        │                                                          │
-                        │  GPIO 18 ──┐                         5V                  │
-                        │  GPIO 19 ──┤── 1kΩ ── BASE [BC547]   │                  │
-                        │  GPIO 21 ──┘          COLETOR ──── 220Ω ──── ânodos      │
-                        │                       EMISSOR ──── GND        (×10 LEDs) │
-                        │                                   cátodos ─── GND        │
-                        │                                                          │
-                        │  Wi-Fi STA (WPA2)                                        │
-                        └───────────────────────────┬──────────────────────────────┘
-                                                    │ LAN (ws://<IP>/...)
-                                          ┌─────────▼──────────┐
-                                          │   Browser (SPA)    │
-                                          │                    │
-                                          │ aba Gravações      │
-                                          │ aba Monitor KWS    │
-                                          │ aba Coleta         │
-                                          └────────────────────┘
-```
-
-### Circuito RGB (transistor BC547, ativo-baixo)
+## Estrutura do projeto
 
 ```
-5V ──── 220Ω ──── COLETOR ──┬── ânodo LED 1
-                             ├── ânodo LED 2   (até 10 LEDs em paralelo por canal)
-         BC547               └── ...
-BASE ◀── 1kΩ ◀── GPIO (3.3V)    cátodos ──── GND
-EMISSOR ──── GND
-
-  GPIO LOW  (duty=0)   → transistor OFF → 5V nos ânodos → LED ACESO
-  GPIO HIGH (duty=255) → transistor ON  → Vce_sat ≈ 0V  → LED APAGADO
-  (firmware inverte: duty_real = 255 − valor_solicitado)
+ligar/
+├── firmware/
+│   └── main/
+│       ├── app_main.c          # Boot, Wi-Fi, HTTP server, criação de tasks
+│       ├── app_state.h         # Globals compartilhados (queues, mutex, fds, state)
+│       ├── wifi_config.h       # Credenciais Wi-Fi (não versionado)
+│       ├── drivers/
+│       │   ├── i2s_driver.c/h  # I2S Philips 32-bit → 16-bit + gain
+│       │   └── ledc_driver.c/h # LED RGB via LEDC/PWM (8-bit, 5kHz)
+│       ├── kws/
+│       │   ├── mfcc.c/h        # MFCC: pré-ênfase, FFT, mel (26), DCT, CMVN
+│       │   ├── mlp.c/h         # Inferência MLP: forward pass, softmax
+│       │   ├── weights.h       # AUTO-GERADO por train_mlp.py — não editar
+│       │   ├── dtw.c/h         # DTW rolling 2-row, banda Sakoe-Chiba (w=6)
+│       │   ├── templates.h     # AUTO-GERADO por generate_templates.py — legacy
+│       │   └── color_catalog.h # Lookup: nome de cor → {r,g,b} (9 cores)
+│       └── tasks/
+│           ├── i2s_reader_task.c/h  # Leitor exclusivo I2S → g_audio_queue + g_kws_queue
+│           ├── audio_task.c/h       # Machine de estados, WS /record e /stream
+│           ├── button_task.c/h      # Polling GPIO4, debounce 50ms → g_click_queue
+│           ├── kws_task.c/h         # KWS 2 estágios, WS /monitor, HTTP /threshold /led
+│           └── led_task.c/h         # g_led_queue → ledc_set_color(r,g,b)
+├── training/
+│   ├── firmware_mfcc.py        # Réplica Python exata do mfcc.c
+│   ├── firmware_mlp.py         # Validação paridade Python ↔ C: inferência com weights.h
+│   ├── extract_features.py     # WAV → MFCC → .npy
+│   ├── train_mlp.py            # Treina MLP → firmware/main/kws/weights.h
+│   ├── generate_templates.py   # .npy → templates.h (legacy — não usado na inferência)
+│   ├── capture_monitor.py      # Captura eventos /monitor via WS
+│   ├── samples/                # WAVs de treino: <palavra>_NNN.wav
+│   └── features/               # MFCCs: <palavra>.npy
+├── web/
+│   └── src/
+│       ├── App.tsx             # 3 abas: Gravações / Monitor / Coleta
+│       ├── hooks/              # useConnection, useRecordings, useStream,
+│       │                       # useStreamVisualizer, useWhisper, useCollection
+│       ├── components/         # MonitorTab, CollectionTab, RecordingList, …
+│       ├── lib/                # db.ts, wav.ts, fft.ts, vizUtils.ts
+│       └── utils/              # monitorLogger.ts (sessão JSONL)
+├── CMakeLists.txt
+├── Makefile
+└── sdkconfig
 ```
-
-| Canal | GPIO | LEDC | Resistor | I_total (5 LEDs) |
-|-------|------|------|----------|-----------------|
-| Vermelho (R) | 18 | CH0 | 220 Ω | ~13,6 mA |
-| Verde (G)    | 19 | CH1 | 220 Ω | ~12,7 mA |
-| Azul (B)     | 21 | CH2 | 220 Ω | ~8,2 mA  |
-
----
 
 ## Fluxo do firmware
 
@@ -103,14 +96,14 @@ Tasks FreeRTOS criadas:
               (via audio_task e kws_task)
 ```
 
-### Machine de estados — audio_task
+### Máquina de estados — audio_task
 
 ```
             ┌──────────┐
             │   IDLE   │◀──────────────────────────────────────────┐
             └────┬─────┘                                           │
                  │                                                 │
-    click + stream_fd≥0          click + record_fd≥0              │
+    click + stream_fd≥0          click + record_fd≥0               │
                  │                        │                        │
                  ▼                        ▼                        │
           ┌──────────────┐      ┌──────────────────┐               │
@@ -202,8 +195,6 @@ Browser                          ESP32
    │  → Blob WAV → IndexedDB     │
 ```
 
----
-
 ## Pipeline de treinamento
 
 ```
@@ -226,57 +217,24 @@ Browser                          ESP32
 6. Aba Monitor na UI
    → feedback visual em tempo real do KWS (probabilidades MLP, palavra detectada)
 ```
-
 ---
 
-## Estrutura do projeto
+## Diagrama do circuito
 
-```
-ligar/
-├── firmware/
-│   └── main/
-│       ├── app_main.c          # Boot, Wi-Fi, HTTP server, criação de tasks
-│       ├── app_state.h         # Globals compartilhados (queues, mutex, fds, state)
-│       ├── wifi_config.h       # Credenciais Wi-Fi (não versionado)
-│       ├── drivers/
-│       │   ├── i2s_driver.c/h  # I2S Philips 32-bit → 16-bit + gain
-│       │   └── ledc_driver.c/h # LED RGB via LEDC/PWM (8-bit, 5kHz)
-│       ├── kws/
-│       │   ├── mfcc.c/h        # MFCC: pré-ênfase, FFT, mel (26), DCT, CMVN
-│       │   ├── mlp.c/h         # Inferência MLP: forward pass, softmax
-│       │   ├── weights.h       # AUTO-GERADO por train_mlp.py — não editar
-│       │   ├── dtw.c/h         # DTW rolling 2-row, banda Sakoe-Chiba (w=6)
-│       │   ├── templates.h     # AUTO-GERADO por generate_templates.py — legacy
-│       │   └── color_catalog.h # Lookup: nome de cor → {r,g,b} (9 cores)
-│       └── tasks/
-│           ├── i2s_reader_task.c/h  # Leitor exclusivo I2S → g_audio_queue + g_kws_queue
-│           ├── audio_task.c/h       # Machine de estados, WS /record e /stream
-│           ├── button_task.c/h      # Polling GPIO4, debounce 50ms → g_click_queue
-│           ├── kws_task.c/h         # KWS 2 estágios, WS /monitor, HTTP /threshold /led
-│           └── led_task.c/h         # g_led_queue → ledc_set_color(r,g,b)
-├── training/
-│   ├── firmware_mfcc.py        # Réplica Python exata do mfcc.c
-│   ├── firmware_mlp.py         # Validação paridade Python ↔ C: inferência com weights.h
-│   ├── extract_features.py     # WAV → MFCC → .npy
-│   ├── train_mlp.py            # Treina MLP → firmware/main/kws/weights.h
-│   ├── generate_templates.py   # .npy → templates.h (legacy — não usado na inferência)
-│   ├── capture_monitor.py      # Captura eventos /monitor via WS
-│   ├── samples/                # WAVs de treino: <palavra>_NNN.wav
-│   └── features/               # MFCCs: <palavra>.npy
-├── web/
-│   └── src/
-│       ├── App.tsx             # 3 abas: Gravações / Monitor / Coleta
-│       ├── hooks/              # useConnection, useRecordings, useStream,
-│       │                       # useStreamVisualizer, useWhisper, useCollection
-│       ├── components/         # MonitorTab, CollectionTab, RecordingList, …
-│       ├── lib/                # db.ts, wav.ts, fft.ts, vizUtils.ts
-│       └── utils/              # monitorLogger.ts (sessão JSONL)
-├── CMakeLists.txt
-├── Makefile
-└── sdkconfig
-```
+![Circuito completo](.specs/images/circuito_completo.jpg)
 
----
+### Circuito dos LEDs RGB
+
+![Circuito LEDs](.specs/images/circuito_leds.jpg)
+
+| Canal | GPIO | LEDC | Resistor | I_total (5 LEDs) |
+|-------|------|------|----------|-----------------|
+| Vermelho (R) | 18 | CH0 | 220 Ω | ~13,6 mA |
+| Verde (G)    | 19 | CH1 | 220 Ω | ~12,7 mA |
+| Azul (B)     | 21 | CH2 | 220 Ω | ~8,2 mA  |
+
+**OBS:** Os valores mais corretos dos resitores para a corrente não são esses, esses foram os valores utilizados pois eram os que eu tinha sobrando para o teste, os valores ideias para o circuito são: R-56, G-54, B-32, já os valores comerciais são: R-56, G-56, B-33.
+
 
 ## Hardware — pinout completo
 
@@ -387,3 +345,27 @@ make flash WORD=verde PORT=/dev/ttyUSB0 # pipeline + flash
 **Triggers:** `ligar`, `desligar`
 
 **Cores (após "ligar"):** `vermelho`, `verde`, `azul`, `amarelo`, `ciano`, `magenta`, `laranja`, `roxo`, `branco`
+
+---
+
+## Evolução do Hardware
+
+### Protótipos iniciais
+
+Primeiros testes separados: microfone e LEDs montados individualmente para validar cada parte do circuito.
+
+![Protótipo — microfone](.specs/images/prototipo_mic.jpg) ![Protótipo — LEDs](.specs/images/prototipo_led.jpg)
+
+### Protótipo integrado
+
+Microfone e LEDs juntos, com o firmware de detecção de palavras rodando.
+
+![Protótipo completo](.specs/images/prototipo_mic_led.jpg)
+
+### Resultado final — LEDs respondendo a comandos de voz
+
+10 LEDs acesos após detecção das palavras "ligar vermelho" e "ligar azul".
+
+![LEDs vermelhos acesos](.specs/images/10_leds_vermelhos.jpg)
+
+![LEDs azuis acesos](.specs/images/10_leds_azul.jpg)
