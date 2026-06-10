@@ -9,6 +9,17 @@ sdkconfig.old
 *.wav
 *.pcm
 
+# Python
+training/.venv/
+training/__pycache__/
+training/features/*.npy
+
+# Logs e monitor
+*.jsonl
+
+# Editor / LSP
+.cache/
+
 # Web
 web/node_modules/
 web/dist/
