@@ -17,6 +17,11 @@ training/features/*.npy
 # Logs e monitor
 *.jsonl
 
+# Documentação local / planos
+docs/
+.specs/features/
+CLAUDE.md
+
 # Editor / LSP
 .cache/
 
