@@ -1,6 +1,6 @@
 # Codebase Concerns
 
-**Analisado:** 2026-06-01
+**Analisado:** 2026-06-10
 
 ## Segurança
 
@@ -24,21 +24,23 @@
 
 ## Known Bugs
 
-**KWS — Zero detecções (bug documentado, em investigação):**
-- Symptoms: Nenhuma detecção no monitor, distâncias DTW na faixa de ruído aleatório (~5.1 para 13D)
-- Trigger: Qualquer fala durante APP_IDLE
-- Files: `firmware/main/poc-microfone.c` (kws_task), `firmware/main/mfcc.c`, `training/extract_features.py`
-- Root cause: Possível desalinhamento entre janela de inferência (ring buffer posição arbitrária) e janela de treino (alinhada pelo onset). Três causas investigadas: (1) ring não captura janela correta relativa à palavra, (2) divergência numérica Python↔C, (3) normalização diferente
-- Docs: `docs/plans/plano-fix-kws-alinhamento.md`, `docs/plans/analise-matematica-kws.md`
+**KWS — Zero detecções (RESOLVIDO via migração DTW→MLP):**
+- Status anterior: Nenhuma detecção, distâncias DTW em faixa de ruído aleatório
+- Resolução: O classificador DTW foi substituído por MLP (624→128→64→10). Com MLP, detecções funcionam normalmente.
+- Dead code remanescente: `dtw.c/h` e `templates.h` ainda existem mas não são compilados — podem ser removidos.
+
+**Schema drift /monitor WebSocket:**
+- Issue: O firmware ainda envia campo `threshold` no JSON do /monitor (valor do MLP threshold, reutilizando `g_dtw_threshold`), mas `KWS_FLOW_CONTRACT.md` diz para nunca mais enviar `threshold`.
+- Files: `firmware/main/tasks/kws_task.c` — todos os 6 pontos de `ws_send_text`
+- Impact: Inconsistência entre documentação do contrato e implementação real; o frontend ainda lê e usa `threshold` para sync do slider — remoção quebraria o frontend.
+- Fix: Ou remover `threshold` do JSON e adaptar frontend, ou atualizar o contrato para documentar que o campo permanece (com semântica de MLP threshold).
 
 ## Tech Debt
 
-**Log de diagnóstico temporário no código de produção:**
-- Issue: `static uint32_t dbg_calls` + 5 linhas de `ESP_LOGI` dentro de `i2s_read_16bit` com comentário `/* DIAGNÓSTICO — remover após confirmar funcionamento */`
-- Files: `firmware/main/poc-microfone.c:191-201`
-- Why: Adicionado durante debug de GPIO errada
-- Impact: Spam no serial nos primeiros 5 chunks de qualquer gravação/stream
-- Fix: Remover bloco entre as marcações `/* DIAGNÓSTICO */`
+**Dead code DTW:**
+- Issue: `firmware/main/kws/dtw.c/h` e `firmware/main/kws/templates.h` existem no repo mas não são listados no `CMakeLists.txt` e nunca mais são incluídos
+- Impact: Confusão para futuros colaboradores; `templates.h` ainda é auto-gerado mas sem uso
+- Fix: Remover `dtw.c`, `dtw.h`, `templates.h` e `generate_templates.py` (ou manter apenas como referência histórica)
 
 **Dois lock files de package manager:**
 - Issue: `yarn.lock` e `package-lock.json` coexistem em `web/`
@@ -49,14 +51,18 @@
 
 **Sincronização de boot por sleep fixo:**
 - Issue: `vTaskDelay(pdMS_TO_TICKS(3000))` aguarda IP antes de iniciar servidor
-- Files: `main/poc-microfone.c:542`
+- Files: `firmware/main/app_main.c`
 - Impact: Falha silenciosa em redes lentas; atraso desnecessário em redes rápidas
 - Fix: `EventGroupWaitBits` aguardando `IP_EVENT_STA_GOT_IP`
 
 **Desconexão WebSocket não limpa fd imediatamente:**
 - Issue: Se cliente desconectar abruptamente, `g_ws_record_fd` / `g_ws_stream_fd` ficam com fd inválido; são limpos apenas quando o próximo `ws_send_binary` falha
-- Files: `firmware/main/poc-microfone.c` — `ws_record_handler`, `ws_stream_handler`
+- Files: `firmware/main/tasks/audio_task.c` — `ws_record_handler`, `ws_stream_handler`
 - Fix: Registrar `httpd_sess_err_hapened_cb` para limpar fd ao detectar desconexão
+
+**`g_ws_monitor_fd` limpeza em send failure (RESOLVIDO):**
+- Status anterior: `ws_send_text()` em `kws_task.c` não resetava `g_ws_monitor_fd = -1` em erro
+- Resolução: Todos os 6 pontos de `ws_send_text` em `kws_task.c` agora resetam `g_ws_monitor_fd = -1` quando `ws_ret != ESP_OK`.
 
 **`useStream` flush por RMS pode descartar áudio:**
 - Issue: Flush quando `buf.length >= 8000 && rms < 200`; silêncio detectado pode cortar frase no meio
@@ -64,17 +70,19 @@
 - Impact: Janela enviada para Whisper pode ser incompleta se o falante fizer pausa curta
 - Fix: VAD mais robusto ou buffer maior com overlap
 
+**KWS_AWAIT_COLOR sem feedback visual ativo (RESOLVIDO):**
+- Resolução: GPIO 23 dedicado ao estado `KWS_AWAIT_COLOR` — acende quando sistema aguarda cor, apaga ao sair do estado.
+- Files: `firmware/main/tasks/kws_task.c`, commit `dceb543`
+
 **Fila de click com profundidade 1:**
 - Issue: `xQueueCreate(1, sizeof(uint8_t))` — segundo click enquanto o primeiro ainda está na fila é descartado silenciosamente
-- Files: `firmware/main/poc-microfone.c` (g_click_queue)
+- Files: `firmware/main/app_main.c` (g_click_queue)
 - Impact: Click duplo rápido pode ser ignorado
 - Fix: Profundidade 2 ou processar click mais rapidamente
 
-**kws_task e audio_task disputam I2S:**
-- Issue: Ambas as tasks chamam `i2s_read_16bit` diretamente; `kws_task` cede com `vTaskDelay(10ms)` quando `g_state != APP_IDLE`, mas não há mutex no I2S
-- Files: `firmware/main/poc-microfone.c` (kws_task, audio_task)
-- Why fragile: I2S lê de DMA FIFO — reads simultâneos causariam corrupção; a lógica de vTaskDelay funciona na prática mas não é garantida pelo driver
-- Safe modification: Adicionar mutex de I2S ou separar canal de captura por task
+**kws_task e audio_task disputavam I2S (RESOLVIDO):**
+- Status anterior: Ambas as tasks chamavam `i2s_read_16bit` diretamente, sem mutex
+- Resolução: `i2s_reader_task` (prio 12) é agora o único leitor do hardware I2S; distribui chunks via `g_audio_queue` → `audio_task` e `g_kws_queue` → `kws_task`.
 
 ## Limites de Escalabilidade
 

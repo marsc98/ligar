@@ -1,6 +1,6 @@
 # Tech Stack
 
-**Analisado:** 2026-06-01
+**Analisado:** 2026-06-10
 
 ## Firmware (ESP32)
 
@@ -15,7 +15,8 @@
 | Componente | Uso |
 |---|---|
 | `driver/i2s_std` | Captura de áudio (driver v5+, Philips mode) |
-| `driver/gpio` | Botão (polling) e LED (GPIO 2) |
+| `driver/gpio` | Botão (polling) e LED onboard (GPIO 2) |
+| `driver/ledc` | LED RGB PWM: 3 canais (R/G/B), 8-bit, 5kHz |
 | `esp_http_server` | HTTP + WebSocket (porta 80) |
 | `esp_wifi` | Wi-Fi STA mode, WPA2-PSK |
 | `esp_netif` | Abstração de rede |
@@ -25,10 +26,16 @@
 ### KWS (Keyword Spotting)
 
 - **Features:** MFCC — 13 coeficientes, 48 frames, janela 0.5s (8000 amostras), hop 10ms
-- **Classificador:** DTW com banda Sakoe-Chiba (window=6)
+- **Classificador:** MLP quantizado int8 — arquitetura 624→128→64→10, forward pass em `mlp.c`
 - **VAD:** RMS threshold (300.0) + mínimo 3 chunks voiced
-- **Rejeição:** modelo "garbage" + ratio threshold (0.75) + variância temporal (0.3)
-- **Templates:** gerados pelo pipeline Python → `firmware/main/templates.h`
+- **Rejeição:** classe "garbage" na MLP + threshold de confiança (padrão 0.50, ajustável via `/threshold`)
+- **Variância temporal:** threshold 0.3 — rejeita silêncio/ruído antes de rodar MLP
+- **Vocabulário (10 classes):** amarelo, azul, branco, desligar, garbage, laranja, ligar, roxo, verde, vermelho
+- **Pesos:** gerados por `train_mlp.py` → `firmware/main/kws/weights.h`
+- **RGB LED:** LEDC/PWM 8-bit em GPIO 18 (R), 19 (G), 21 (B) via `ledc_driver.c`
+- **LED indicador KWS_AWAIT_COLOR:** GPIO 23 (LED dedicado ao estado de aguardo de cor)
+
+> `dtw.c/h` e `templates.h` ainda existem no repo mas **não são compilados** (dead code desde migração para MLP).
 
 ## Frontend (Web SPA)
 
@@ -63,8 +70,8 @@
 - **Linguagem:** Python 3.12
 - **Dependências:** numpy ≥1.24, scipy ≥1.10, librosa ≥0.10, soundfile ≥0.12, websockets ≥12.0
 - **Venv:** `training/.venv/`
-- **Scripts:** `extract_features.py`, `generate_templates.py`, `firmware_mfcc.py`, `capture_monitor.py`
-- **Artefatos:** `training/features/*.npy` → `firmware/main/templates.h`
+- **Scripts:** `extract_features.py`, `train_mlp.py`, `firmware_mfcc.py`, `firmware_mlp.py`, `capture_monitor.py`, `generate_templates.py` (deprecated — era para DTW)
+- **Artefatos:** `training/features/*.npy` → `train_mlp.py` → `firmware/main/kws/weights.h`
 
 ## Tooling
 

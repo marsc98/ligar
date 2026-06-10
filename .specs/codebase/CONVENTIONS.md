@@ -1,6 +1,6 @@
 # Code Conventions
 
-**Analisado:** 2026-06-01
+**Analisado:** 2026-06-10
 
 ## Firmware (C)
 
@@ -14,27 +14,46 @@
 | `_t` suffix | `app_state_t`, `wav_header_t` |
 | `TAG` constante | `static const char *TAG = "INMP441"` |
 
+### Estrutura modular
+
+O firmware é dividido em 4 camadas:
+
+```
+app_main.c          — ponto de entrada; orquestra init e criação de tasks
+app_state.h         — globals compartilhados (extern): sem lógica, só declarações
+drivers/            — abstração de hardware (I2S, LEDC); sem FreeRTOS no header público
+kws/                — algoritmos puros (MFCC, DTW, templates, color_catalog); sem deps de tasks
+tasks/              — tasks FreeRTOS; dependem de drivers/ e kws/; nunca ao contrário
+```
+
+Cada módulo expõe apenas o necessário via header. Funções internas são `static`.
+
 ### Estilo
 
-- Todas as funções e variáveis de arquivo são `static` — zero símbolo público além de `app_main`
-- `__attribute__((packed))` em structs de protocolo (`wav_header_t`)
+- Funções e variáveis de arquivo são `static`; funções públicas declaradas no `.h` correspondente
 - `ESP_ERROR_CHECK()` em todas as chamadas de init — crash-fast
 - Comentários em Português (BR)
-- Blocos de seção delimitados com `/* ─────────────── NOME ─────────────── */`
+- Blocos de seção delimitados com `/* ── NOME ── */`
 - Sem ISR handlers — botão usa polling + debounce por software em task dedicada
+- `TAG` por arquivo: `static const char *TAG = "MODULO"`
 
 ### Alocação de memória
 
 ```c
-// Buffer I2S — deve ser DMA-capable
+// Buffer I2S em audio_task — deve ser DMA-capable
 read_buf = heap_caps_malloc(I2S_READ_BYTES, MALLOC_CAP_DMA);
 
+// Ring buffer KWS — stack estático (s_kws_ring[MFCC_WIN_SAMPLES])
 // Sem buffer de gravação — PCM vai direto I2S → WS sem acumular
 ```
 
 ### Debounce do botão
 
 Polling a 10ms, 5 leituras estáveis = 50ms de debounce. Click disparado no falling edge (pressionar); soltar não gera evento. Evento publicado via `xQueueSend(g_click_queue, &evt, 0)`.
+
+### LED RGB
+
+Comandos enviados via `xQueueSend(g_led_queue, &cmd, 0)` onde `cmd` é `led_command_t {r, g, b}`. `led_task` consume a fila e chama `ledc_set_color()`. Bloqueio não-urgente — `xQueueSend` com timeout 0.
 
 ### Logging
 
@@ -43,22 +62,6 @@ ESP_LOGI(TAG, "mensagem normal");
 ESP_LOGW(TAG, "aviso");
 ESP_LOGE(TAG, "erro crítico");
 ```
-
-### Ordem de seções no arquivo
-
-1. Includes
-2. `#include "wifi_config.h"` (credenciais externas)
-3. `#define` de pinos e configuração
-4. Estado global (enum + variáveis `static`)
-5. Struct WAV + helper
-6. I2S init + read
-7. WebSocket handlers
-8. Audio task
-9. Button task
-10. Wi-Fi init
-11. HTTP server init
-12. GPIO init
-13. `app_main`
 
 ---
 
@@ -108,9 +111,11 @@ type VisualizerMode = 'waveform' | 'fft' | 'both'
 - Constantes em `UPPER_CASE`: `SAMPLE_RATE`, `TEMPLATE_COUNT`, `N_FRAMES`, `N_COEFS`
 - Docstrings no topo do arquivo descrevendo uso CLI (não nas funções)
 
-### Invariante crítica
+### Invariantes críticas
 
-`firmware_mfcc.py` deve ser **numericamente idêntico** a `mfcc.c`. Qualquer alteração nos parâmetros MFCC (frame length, hop, n_mels, n_coefs, fmin, fmax) deve ser espelhada em ambos. O `extract_features.py` usa `firmware_mfcc.py` diretamente; `generate_templates.py` usa apenas os shapes `(N_FRAMES, N_COEFS)`.
+1. `firmware_mfcc.py` deve ser **numericamente idêntico** a `mfcc.c`. Qualquer alteração nos parâmetros MFCC (frame length, hop, n_mels, n_coefs, fmin, fmax) deve ser espelhada em ambos.
+2. `firmware_mlp.py` deve ser **numericamente idêntico** a `mlp.c` com os pesos de `weights.h`. Validação: rodar `firmware_mlp.py <wav>` e comparar com inferência C no firmware.
+3. A ordem das classes em `MLP_CLASS_NAMES[]` em `weights.h` deve bater exatamente com a ordem gerada por `train_mlp.py`.
 
 ### Alinhamento de onset
 
